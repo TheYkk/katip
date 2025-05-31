@@ -1,309 +1,570 @@
-// src/storage/segment.rs
-use crate::storage::index::Index;
-use crate::storage::log_entry::LogEntry;
-use bincode::{deserialize_from, serialize};
-use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf}; // Added Index import
+use std::io::{self, Write, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, Duration}; // Added SystemTime, Duration
+ // Required for LogEntry if not directly used here
+use crc32fast::Hasher;
 
-// Represents a single segment file in the log.
-pub struct Segment {
+use crate::storage::entry::LogEntry;
+use crate::Error; // Assuming Error enum is in crate root or crate::errors
+
+const DEFAULT_MAX_SEGMENT_SIZE: u64 = 1024 * 1024 * 16; // 16MB, placeholder
+
+#[derive(Debug)]
+pub struct LogSegment {
     pub base_offset: u64,
-    // Renamed current_offset_in_segment to current_relative_offset for clarity with index
-    pub current_relative_offset: u64,
-    pub file_path: PathBuf, // Path to the .log file
-    file: File,             // The .log data file
-    index: Index,           // The associated .index file
-    max_segment_bytes: u64,
-    current_data_bytes: u64, // Tracks the byte size of data in the .log file (excluding headers of future entries)
+    pub file_path: PathBuf,
+    // Using BufWriter could improve performance, but start simple
+    pub file: File,
+    pub current_size: u64,
+    pub max_segment_size: u64,
+    // Index: (absolute_offset, file_position_start_of_entry)
+    pub index: Vec<(u64, u64)>,
+    pub(crate) created_at: SystemTime, // Made pub(crate) for testing access if needed
+    max_segment_duration: Option<Duration>,
+    num_entries: u64,
 }
 
-impl Segment {
-    // Creates a new segment or opens an existing one.
-    // Initializes the data file (.log) and the index file (.index).
-    pub fn new<P: AsRef<Path>>(
-        dir: P,
-        base_offset: u64,
-        max_segment_bytes: u64,
-    ) -> io::Result<Self> {
-        let file_path = dir.as_ref().join(format!("{}.log", base_offset));
-        let data_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true) // Need write access for appends and potential truncation
+impl LogSegment {
+    pub fn new(dir: &Path, base_offset: u64, max_segment_size: Option<u64>, max_duration: Option<Duration>) -> Result<Self, Error> {
+        let segment_file_name = format!("{}.log", base_offset);
+        let file_path = dir.join(segment_file_name);
+
+        let file = OpenOptions::new()
+            .create(true) // Create if it doesn't exist
+            .append(true) // Open in append mode for writes initially
+            .read(true)   // Need read for recovery and reading entries
             .open(&file_path)?;
 
-        // Create or open the associated index file
-        let index_module = crate::storage::index::Index::new(dir.as_ref(), base_offset)?;
-
-        Ok(Segment {
+        // In a real scenario, we might need to rebuild index if file exists
+        // For now, new segment means new file or empty existing one for simplicity.
+        // If loading existing segments, this logic would be different.
+        Ok(LogSegment {
             base_offset,
-            current_relative_offset: 0, // Initialized to 0, will be updated by load_or_initialize
             file_path,
-            file: data_file,
-            index: index_module,
-            max_segment_bytes,
-            current_data_bytes: 0, // Initialized to 0, will be updated by load_or_initialize
+            file,
+            current_size: 0, // Assuming new segment starts empty or we'd load its size
+            max_segment_size: max_segment_size.unwrap_or(DEFAULT_MAX_SEGMENT_SIZE),
+            index: Vec::new(),
+            created_at: SystemTime::now(),
+            max_segment_duration: max_duration,
+            num_entries: 0,
         })
     }
 
-    // Loads an existing segment's index and scans the data file (.log)
-    // to ensure consistency and determine the next writable position and relative offset.
-    // If inconsistencies are found (e.g. index points beyond data, or data entry checksum fails),
-    // it may truncate the data file and rebuild the index from available valid entries.
-    pub fn load_or_initialize(&mut self) -> io::Result<()> {
-        self.index.load()?; // Load existing index entries into memory
+    pub fn append(&mut self, entry: &mut LogEntry) -> Result<u64, Error> {
+        // 1. Finalize entry details
+        entry.offset = self.base_offset + self.num_entries;
+        // entry.timestamp is set by caller (Log struct)
 
-        self.current_data_bytes = 0; // Reset before scan
-        self.current_relative_offset = 0;
+        // 2. Calculate checksum
+        let mut hasher = Hasher::new();
+        hasher.update(&entry.key);
+        hasher.update(&entry.value);
+        entry.checksum = hasher.finalize();
 
-        let mut scan_start_pos_in_log: u64 = 0;
-        let mut next_expected_relative_offset: u64 = 0;
+        entry.key_length = entry.key.len() as u32;
+        entry.value_length = entry.value.len() as u32;
 
-        // Try to find a consistent point to start scanning the log file from, based on the index
-        if let Some(last_indexed_rel_offset) = self.index.get_last_relative_offset() {
-            if let Some(pos_of_last_idx_entry_data) =
-                self.index.find_position(last_indexed_rel_offset)
-            {
-                // Check if this position is valid in the log file
-                self.file
-                    .seek(SeekFrom::Start(pos_of_last_idx_entry_data))?;
-                let mut len_bytes_header = [0u8; 4];
-                if self.file.read_exact(&mut len_bytes_header).is_ok() {
-                    let data_len = u32::from_be_bytes(len_bytes_header) as u64;
-                    // Check if the full entry (header + data) is within file bounds (if we knew file size)
-                    // For now, we assume if we can read header, we can attempt to read data
-                    scan_start_pos_in_log = pos_of_last_idx_entry_data + 4 + data_len;
-                    next_expected_relative_offset = last_indexed_rel_offset + 1;
-                } else {
-                    // Failed to read the log entry data for the last indexed offset.
-                    // This suggests the log file is shorter than the index implies.
-                    eprintln!("Segment {}: .log file is shorter than index {:?} implies (last indexed rel_offset: {} at pos {}). Rebuilding index for this segment.",
-                        self.base_offset, self.index.file_path, last_indexed_rel_offset, pos_of_last_idx_entry_data);
-                    // Recreate index, effectively clearing it for rebuild
-                    self.index = Index::new(
-                        self.file_path.parent().unwrap_or_else(|| Path::new(".")),
-                        self.base_offset,
-                    )?;
-                    scan_start_pos_in_log = 0; // Rescan log from start
-                    next_expected_relative_offset = 0;
-                }
-            } else {
-                // This case (last_indexed_rel_offset exists but find_position returns None) should ideally not happen with current Index impl.
-                eprintln!("Segment {}: Index internal inconsistency for {:?} (last_rel_offset {} position lookup failed). Rebuilding index.", self.base_offset, self.index.file_path, last_indexed_rel_offset);
-                self.index = Index::new(
-                    self.file_path.parent().unwrap_or_else(|| Path::new(".")),
-                    self.base_offset,
-                )?;
-                scan_start_pos_in_log = 0;
-                next_expected_relative_offset = 0;
-            }
+        // 3. Serialize entry header (fixed size part) and then data
+        // For simplicity, let's serialize the whole LogEntry with bincode.
+        // A more optimized version might write fixed-size parts directly.
+        let serialized_entry = bincode::serialize(entry).map_err(Error::Serialization)?;
+        let entry_len = serialized_entry.len() as u64;
+
+        if self.current_size + entry_len > self.max_segment_size && !self.index.is_empty() {
+            // Do not append if it exceeds max size, unless it's the very first entry.
+            return Err(Error::SegmentFull);
         }
 
-        // Position file pointer and set internal counters for scanning from determined point
-        self.file.seek(SeekFrom::Start(scan_start_pos_in_log))?;
-        self.current_data_bytes = scan_start_pos_in_log;
-        self.current_relative_offset = next_expected_relative_offset;
+        let file_position = self.current_size; // Or self.file.seek(SeekFrom::End(0))? if not strictly append
 
-        // Scan the .log file from scan_start_pos_in_log to the end or max_segment_bytes
-        loop {
-            let current_pos_in_log = self.file.stream_position()?;
-            // Stop if we are at or beyond the max segment size (for writing, reading might be different)
-            if current_pos_in_log >= self.max_segment_bytes {
-                break;
+        self.file.write_all(&serialized_entry)?;
+        self.file.flush()?; // Ensure it's written to disk
+
+        // 4. Update index and current_size
+        self.index.push((entry.offset, file_position));
+        self.current_size += entry_len;
+        self.num_entries += 1;
+
+        Ok(entry.offset)
+    }
+
+    pub fn read(&mut self, relative_offset_in_segment: u64) -> Result<Option<LogEntry>, Error> {
+        // This method expects an offset *relative to the segment's base_offset*
+        // The Log struct will find the right segment and calculate this.
+        // However, our index stores *absolute* offsets. So we search for absolute offset.
+        let target_absolute_offset = self.base_offset + relative_offset_in_segment;
+
+        // Find in index: (absolute_offset, file_position)
+        if let Some((_offset, file_position)) = self.index.iter().find(|&&(o, _)| o == target_absolute_offset).copied() {
+            self.file.seek(SeekFrom::Start(file_position))?;
+
+            // This is tricky: how much to read?
+            // If we stored entry length on disk before the entry, we could read that first.
+            // Or, if all entries are LogEntry serialized, and we know where the *next* entry starts (or EOF)
+            // For now, let's assume bincode handles "read to end of object" if we deserialize from the stream.
+            // This might be inefficient or error-prone if file contains more data / garbage.
+            // A robust way: store length of serialized_entry before the entry itself.
+            // u32: length | data
+
+            // Simplified approach: bincode::deserialize_from will read as much as it needs.
+            // This requires the file cursor to be exactly at the start of a serialized LogEntry.
+            let entry: LogEntry = bincode::deserialize_from(&mut self.file).map_err(Error::Deserialization)?;
+
+            // Verify checksum
+            let mut hasher = Hasher::new();
+            hasher.update(&entry.key);
+            hasher.update(&entry.value);
+            if hasher.finalize() != entry.checksum {
+                return Err(Error::ChecksumMismatch);
             }
 
-            let mut len_bytes = [0u8; 4];
-            match self.file.read_exact(&mut len_bytes) {
-                Ok(_) => {
-                    let data_len = u32::from_be_bytes(len_bytes) as u64;
+            // Verify offset matches (sanity check)
+            if entry.offset != target_absolute_offset {
+                // This would indicate a bug in indexing or file corruption
+                eprintln!("Offset mismatch: expected {}, found {}", target_absolute_offset, entry.offset);
+                return Err(Error::OffsetNotFound); // Or a more specific error
+            }
 
-                    // Check for partial write: if entry + header exceeds max_segment_bytes or file length
-                    if current_pos_in_log + 4 + data_len > self.max_segment_bytes {
-                        eprintln!("Segment {}: Found partial entry at end of segment (pos {}). Truncating .log file.", self.base_offset, current_pos_in_log);
-                        self.file.set_len(current_pos_in_log)?; // Truncate file
-                        break;
-                    }
-                    // At this point, we expect to read a full entry.
-                    // If this relative offset is not in the index OR if it is but points to a different log position,
-                    // then the index is out of sync or corrupt.
-                    let current_entry_is_indexed_correctly =
-                        self.index.find_position(self.current_relative_offset)
-                            == Some(current_pos_in_log);
+            Ok(Some(entry))
+        } else {
+            Ok(None) // Offset not found in this segment's index
+        }
+    }
 
-                    if !current_entry_is_indexed_correctly {
-                        // If find_position was None, it means index is missing this entry.
-                        // If find_position was Some(other_pos), it means index is pointing wrong for this entry.
-                        // In a more robust system, we might try to validate the entry here (checksum) before adding to index.
-                        // For now, if it's not indexed correctly, we add/overwrite it.
-                        // If we are rebuilding (because index was cleared earlier), this will add all entries.
-                        self.index
-                            .add_entry(self.current_relative_offset, current_pos_in_log)?;
+    // Load an existing segment file. Populate index.
+    pub fn load_existing(file_path: PathBuf, base_offset: u64, max_segment_size: Option<u64>, max_duration: Option<Duration>) -> Result<Self, Error> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true) // Still need append for future writes if it becomes active
+            .open(&file_path)?;
+
+        let mut current_pos = 0u64;
+        let mut index = Vec::new();
+        let mut entries_count_in_segment = 0;
+
+        // Read entries one by one to rebuild index
+        // This assumes entries are tightly packed and bincode can deserialize them sequentially.
+        // And that LogEntry also contains its own offset.
+        loop {
+            // Attempt to deserialize. If it fails, assume EOF or corruption.
+            match bincode::deserialize_from::<&mut File, LogEntry>(&mut file) {
+                Ok(entry) => {
+                    // Verify expected offset if possible, or trust the entry's offset
+                    // For now, we trust entry.offset relative to base_offset
+                    if entry.offset != base_offset + entries_count_in_segment {
+                        // This indicates potential corruption or out-of-order entries
+                        // For a robust system, handle this (e.g., truncate or error)
+                        return Err(Error::InitializationError(format!(
+                            "Offset mismatch during segment load: file {:?}, expected offset {}, found {}. Corruption?",
+                            file_path, base_offset + entries_count_in_segment, entry.offset
+                        )));
                     }
 
-                    // Skip over the entry's data to get to the next header
-                    if self.file.seek(SeekFrom::Current(data_len as i64)).is_err() {
-                        // Could not seek, implies partial write of data itself.
-                        eprintln!("Segment {}: .log file ended unexpectedly after reading entry header at {}. Truncating.", self.base_offset, current_pos_in_log);
-                        self.file.set_len(current_pos_in_log)?; // Truncate before this partially written entry
-                        break;
+                    // Verify checksum
+                    let mut hasher = Hasher::new();
+                    hasher.update(&entry.key);
+                    hasher.update(&entry.value);
+                    if hasher.finalize() != entry.checksum {
+                         return Err(Error::InitializationError(format!(
+                            "Checksum mismatch during segment load: file {:?}, offset {}. Corruption?",
+                            file_path, entry.offset
+                        )));
                     }
-                    self.current_data_bytes = current_pos_in_log + 4 + data_len;
-                    self.current_relative_offset += 1;
+
+                    let entry_file_start_pos = current_pos;
+                    // To get entry_len, we'd ideally have it stored.
+                    // Or, seek current pos, serialize, get len, then seek back. (inefficient)
+                    // Or, after deserializing, tell() gives end pos. entry_len = end_pos - current_pos
+                    let entry_end_pos = file.seek(SeekFrom::Current(0))?;
+                    let entry_len = entry_end_pos - current_pos;
+
+                    index.push((entry.offset, entry_file_start_pos));
+                    current_pos += entry_len;
+                    entries_count_in_segment += 1; // This becomes self.num_entries
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Clean end of file, all read.
+                Err(e) => {
+                    if let bincode::ErrorKind::Io(io_err) = e.as_ref() {
+                        if io_err.kind() == io::ErrorKind::UnexpectedEof {
+                            // Reached end of file, expected if file is properly terminated.
+                            break;
+                        }
+                    }
+                    // Any other deserialization error is problematic.
+                    // This could also be an EOF if the file is truncated.
+                    // For now, we break, assuming it's a clean EOF.
+                    // A production system would log this error.
+                    eprintln!("Deserialization error during segment load (file: {:?}): {:?}. Assuming EOF or truncated segment.", file_path, e);
                     break;
                 }
-                Err(e) => return Err(e), // Other I/O error
             }
         }
-        // After scan, ensure file pointer is at the end of valid data for subsequent appends
-        self.file.seek(SeekFrom::Start(self.current_data_bytes))?;
-        self.index.sync_all()?; // Persist any new index entries from scan/rebuild
-        Ok(())
+
+        Ok(LogSegment {
+            base_offset,
+            file_path,
+            file,
+            current_size: current_pos,
+            max_segment_size: max_segment_size.unwrap_or(DEFAULT_MAX_SEGMENT_SIZE),
+            index,
+            created_at: SystemTime::now(), // For a loaded segment, its "age" for expiration effectively starts now.
+                                         // Or, try to parse from filename/metadata if that scheme is adopted later.
+            max_segment_duration: max_duration,
+            num_entries: entries_count_in_segment,
+        })
     }
 
-    // Appends a LogEntry to this segment.
-    pub fn append(&mut self, key: Vec<u8>, value: Vec<u8>) -> io::Result<Option<u64>> {
-        let absolute_offset = self.base_offset + self.current_relative_offset;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let key_length = key.len() as u32;
-        let value_length = value.len() as u32;
-
-        // Prepare data for checksum
-        let mut csum_data = Vec::new();
-        csum_data.extend_from_slice(&absolute_offset.to_be_bytes());
-        csum_data.extend_from_slice(&timestamp.to_be_bytes());
-        csum_data.extend_from_slice(&key_length.to_be_bytes());
-        csum_data.extend_from_slice(&value_length.to_be_bytes());
-        csum_data.extend_from_slice(&key);
-        csum_data.extend_from_slice(&value);
-        let mut hasher = Hasher::new();
-        hasher.update(&csum_data);
-        let checksum = hasher.finalize();
-
-        let entry = LogEntry {
-            offset: absolute_offset,
-            timestamp,
-            key_length,
-            value_length,
-            checksum,
-            key,
-            value,
-        };
-        let serialized_entry =
-            serialize(&entry).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let entry_len_on_disk = serialized_entry.len() as u64;
-
-        // Check if segment has space for this entry (4 bytes for length prefix + entry data)
-        if self.current_data_bytes + 4 + entry_len_on_disk > self.max_segment_bytes {
-            return Ok(None); // Segment is full
-        }
-
-        let position_before_write = self.current_data_bytes; // This is where the entry's length header will start
-
-        // Ensure writer is at the end of the segment data file
-        self.file.seek(SeekFrom::Start(position_before_write))?;
-        // Write length prefix, then the entry
-        self.file
-            .write_all(&(entry_len_on_disk as u32).to_be_bytes())?;
-        self.file.write_all(&serialized_entry)?;
-        // self.file.flush()?; // Optional: flush per entry, or rely on higher level flush / OS caching
-
-        // Add entry to index
-        self.index
-            .add_entry(self.current_relative_offset, position_before_write)?;
-
-        // Update segment state
-        self.current_data_bytes += 4 + entry_len_on_disk;
-        self.current_relative_offset += 1;
-
-        Ok(Some(absolute_offset))
+    pub fn is_empty(&self) -> bool {
+        self.num_entries == 0
     }
 
-    // Reads an entry by its relative offset *within this segment*.
-    pub fn read_entry_by_relative_offset(
-        &mut self,
-        target_relative_offset: u64,
-    ) -> io::Result<Option<LogEntry>> {
-        match self.index.find_position(target_relative_offset) {
-            Some(position) => {
-                self.file.seek(SeekFrom::Start(position))?;
-                let mut len_bytes = [0u8; 4];
-                self.file.read_exact(&mut len_bytes)?; // Read the length prefix
-                let len = u32::from_be_bytes(len_bytes);
-
-                let mut entry_buf = vec![0; len as usize];
-                self.file.read_exact(&mut entry_buf)?; // Read the entry data
-
-                let entry: LogEntry = deserialize_from(&*entry_buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-                // Sanity check: does the deserialized entry's own offset match what we expected?
-                if entry.offset != self.base_offset + target_relative_offset {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                        format!("Segment {}: Index-Log offset mismatch. Read entry for abs_offset {} (key: {:?}), but expected abs_offset {} (rel_offset {}). Index pointed to byte {}.",
-                        self.base_offset, entry.offset, String::from_utf8_lossy(&entry.key), self.base_offset + target_relative_offset, target_relative_offset, position)));
-                }
-
-                // Verify checksum
-                let mut csum_data = Vec::new();
-                csum_data.extend_from_slice(&entry.offset.to_be_bytes());
-                csum_data.extend_from_slice(&entry.timestamp.to_be_bytes());
-                csum_data.extend_from_slice(&entry.key_length.to_be_bytes());
-                csum_data.extend_from_slice(&entry.value_length.to_be_bytes());
-                csum_data.extend_from_slice(&entry.key);
-                csum_data.extend_from_slice(&entry.value);
-                let mut hasher = Hasher::new();
-                hasher.update(&csum_data);
-                if hasher.finalize() != entry.checksum {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "Segment {}: Checksum mismatch for entry at abs_offset {}",
-                            self.base_offset, entry.offset
-                        ),
-                    ));
-                }
-                Ok(Some(entry))
+    pub fn has_expired(&self) -> bool {
+        if let Some(duration) = self.max_segment_duration {
+            // An empty segment can still be considered expired if it's old.
+            // The decision not to rotate an empty active segment is up to the Log struct.
+            match SystemTime::now().duration_since(self.created_at) {
+                Ok(age) => age > duration,
+                Err(_) => false, // Clock went backwards, assume not expired for safety
             }
-            None => Ok(None), // Not found in index
+        } else {
+            false
         }
     }
+
+    // Getter for num_entries field
+    pub fn num_entries(&self) -> u64 {
+        self.num_entries
+    }
+
+    // Getter for created_at field
+    pub(crate) fn created_at(&self) -> SystemTime { // pub(crate) for tests
+        self.created_at
+    }
+
+    // Getter for base_offset
+    pub fn base_offset(&self) -> u64 {
+        self.base_offset
+    }
+
+    // Getter for file_path
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+
 
     pub fn is_full(&self) -> bool {
-        // A more robust check might consider a small minimum entry size.
-        // If current_data_bytes is very close to max_segment_bytes, it's likely full.
-        // The append method does the exact check against the incoming entry's size.
-        self.current_data_bytes >= self.max_segment_bytes
+        self.current_size >= self.max_segment_size
     }
 
-    // Flushes both data file and index file to disk.
-    pub fn flush_all(&mut self) -> io::Result<()> {
+    // Close is mostly handled by Drop, but explicit flush can be useful.
+    pub fn close(mut self) -> Result<(), Error> {
         self.file.flush()?;
-        self.index.sync_all()
+        // File is closed when `self` is dropped.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use crate::storage::entry::LogEntry; // Explicit import for clarity in tests
+    use std::io::{Write, Seek, SeekFrom};
+    use assert_matches::assert_matches;
+
+
+    // Helper to create a LogEntry for testing
+    fn create_test_log_entry(offset: u64, key: &[u8], value: &[u8]) -> LogEntry {
+        // In actual use, timestamp, checksum, key_length, value_length are set by Log/LogSegment
+        LogEntry {
+            offset,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            key_length: key.len() as u32,
+            value_length: value.len() as u32,
+            checksum: 0, // Will be calculated by segment.append
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
     }
 
-    // Gets the next relative offset for this segment.
-    pub fn get_current_relative_offset(&self) -> u64 {
-        self.current_relative_offset
+    // Helper for tests needing a segment
+    fn create_test_segment(dir_path: &Path, base_offset: u64, max_size: Option<u64>, max_duration: Option<Duration>) -> LogSegment {
+        LogSegment::new(dir_path, base_offset, max_size, max_duration).unwrap()
     }
 
-    #[allow(dead_code)]
-    pub fn get_current_data_bytes(&self) -> u64 {
-        self.current_data_bytes
+
+    #[test]
+    fn test_segment_new_creates_file() {
+        let dir = tempdir().unwrap();
+        let segment = create_test_segment(dir.path(), 0, Some(1024), None);
+        assert!(segment.file_path().exists());
+        assert_eq!(segment.base_offset(), 0);
+        assert_eq!(segment.current_size, 0);
+        assert!(segment.index.is_empty());
+        assert_eq!(segment.num_entries(), 0);
     }
 
-    // Renamed from original flush() to avoid confusion with flush_all()
-    // This is specific to the data file, used before by Log's roll_segment.
-    // Now flush_all is preferred.
-    #[allow(dead_code)]
-    pub fn flush_data_file(&mut self) -> io::Result<()> {
-        self.file.flush()
+    #[test]
+    fn test_segment_append_and_read_single_entry() {
+        let dir = tempdir().unwrap();
+        let mut segment = create_test_segment(dir.path(), 0, Some(1024), None);
+
+        let mut entry = create_test_log_entry(0, b"key1", b"value1");
+        let original_key = entry.key.clone();
+        let original_value = entry.value.clone();
+
+        let offset = segment.append(&mut entry).unwrap();
+        assert_eq!(offset, 0); // First entry in a new segment, relative offset is 0, absolute is base_offset + 0
+        assert_eq!(segment.num_entries(), 1);
+        assert!(segment.current_size > 0);
+        assert_eq!(segment.index[0], (0, 0)); // Offset 0, file position 0
+
+        // Check entry fields were updated
+        assert_eq!(entry.offset, 0); // Absolute offset
+        assert_ne!(entry.checksum, 0); // Checksum should be calculated
+        assert_eq!(entry.key_length, original_key.len() as u32);
+        assert_eq!(entry.value_length, original_value.len() as u32);
+
+
+        let read_entry = segment.read(0).unwrap().expect("Failed to read entry");
+        assert_eq!(read_entry.offset, 0); // Absolute offset
+        assert_eq!(read_entry.key, original_key);
+        assert_eq!(read_entry.value, original_value);
+        assert_eq!(read_entry.checksum, entry.checksum);
+    }
+
+    #[test]
+    fn test_segment_append_and_read_multiple_entries() {
+        let dir = tempdir().unwrap();
+        let mut segment = LogSegment::new(dir.path(), 100, Some(2048), None).unwrap(); // base_offset 100, Added None for max_duration
+
+        let mut entry1 = create_test_log_entry(100, b"key1", b"value1");
+        let offset1 = segment.append(&mut entry1).unwrap();
+        assert_eq!(offset1, 100);
+
+        let mut entry2 = create_test_log_entry(101, b"key2", b"value2_long");
+        let offset2 = segment.append(&mut entry2).unwrap();
+        assert_eq!(offset2, 101);
+
+        assert_eq!(segment.num_entries(), 2);
+
+        let read_entry1 = segment.read(0).unwrap().expect("Failed to read entry 1"); // relative offset 0
+        assert_eq!(read_entry1.offset, 100);
+        assert_eq!(read_entry1.key, b"key1");
+
+        let read_entry2 = segment.read(1).unwrap().expect("Failed to read entry 2"); // relative offset 1
+        assert_eq!(read_entry2.offset, 101);
+        assert_eq!(read_entry2.value, b"value2_long");
+    }
+
+    #[test]
+    fn test_segment_is_full() {
+        let dir = tempdir().unwrap();
+        // Max size enough for approx one entry, to easily test fullness
+        let mut segment = create_test_segment(dir.path(), 0, Some(100), None);
+
+        let mut entry1 = create_test_log_entry(0, b"key1", b"this is a relatively long value to fill segment");
+        segment.append(&mut entry1).unwrap();
+
+        // Depending on bincode overhead, this might make it full or not.
+        // If not, append another small one.
+        if !segment.is_full() {
+            let mut entry2 = create_test_log_entry(1, b"k2", b"v2");
+             // This append might fail if the first entry already made it "full" for the next one
+            let res = segment.append(&mut entry2);
+            if res.is_ok() {
+                 assert!(segment.is_full(), "Segment should be full after two entries if entry2 fit and made it full");
+            } else {
+                assert_matches!(res, Err(Error::SegmentFull));
+                // If entry2 failed due to SegmentFull, current_size is unchanged from after entry1.
+                // is_full() reflects state after entry1. It is not necessarily true.
+                // The assertion here was likely too strong.
+                // We've asserted that res is Err(SegmentFull). That's the main check for this path.
+                // We can check that current_size + size_of_entry2 > max_segment_size
+                // For now, let's remove the possibly incorrect assert!(segment.is_full()).
+                // The crucial part is that entry2 was rejected as expected.
+            }
+        } else { // Segment was already full after entry1
+            assert!(segment.is_full(), "Segment should be full after one large entry if it alone exceeded max_size");
+        }
+
+        let mut entry3 = create_test_log_entry(2, b"key3", b"value3");
+        let result = segment.append(&mut entry3);
+        assert_matches!(result, Err(Error::SegmentFull));
+    }
+
+    #[test]
+    fn test_segment_read_offset_out_of_bounds() {
+        let dir = tempdir().unwrap();
+        let mut segment = create_test_segment(dir.path(), 0, Some(1024), None);
+        let mut entry = create_test_log_entry(0, b"key1", b"value1");
+        segment.append(&mut entry).unwrap();
+
+        let result = segment.read(1); // Relative offset 1, but only entry 0 exists
+        assert!(result.unwrap().is_none());
+
+        let result2 = segment.read(100); // Way out of bounds
+        assert!(result2.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_segment_reload_and_read() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("0.log");
+        let max_size = Some(1024u64);
+
+        let mut entry1_orig = create_test_log_entry(0, b"key_reload_1", b"value_reload_1");
+        let entry1_key = entry1_orig.key.clone();
+        let entry1_val = entry1_orig.value.clone();
+
+        let mut entry2_orig = create_test_log_entry(1, b"key_reload_2", b"value_reload_2_longer");
+        let entry2_key = entry2_orig.key.clone();
+        let entry2_val = entry2_orig.value.clone();
+
+        {
+            let mut segment = create_test_segment(dir.path(), 0, max_size, None);
+            segment.append(&mut entry1_orig).unwrap();
+            segment.append(&mut entry2_orig).unwrap();
+            // Segment goes out of scope, file is flushed and closed (due to Drop on File)
+        }
+
+        let mut reloaded_segment = LogSegment::load_existing(segment_path, 0, max_size, None).unwrap();
+
+        assert_eq!(reloaded_segment.num_entries(), 2);
+        assert!(reloaded_segment.current_size > 0);
+        assert_eq!(reloaded_segment.base_offset, 0);
+
+        let read_entry1 = reloaded_segment.read(0).unwrap().expect("Failed to read entry 1 after reload");
+        assert_eq!(read_entry1.offset, 0);
+        assert_eq!(read_entry1.key, entry1_key);
+        assert_eq!(read_entry1.value, entry1_val);
+
+        let read_entry2 = reloaded_segment.read(1).unwrap().expect("Failed to read entry 2 after reload");
+        assert_eq!(read_entry2.offset, 1);
+        assert_eq!(read_entry2.key, entry2_key);
+        assert_eq!(read_entry2.value, entry2_val);
+    }
+
+    #[test]
+    fn test_segment_checksum_error_on_load() {
+        let dir = tempdir().unwrap();
+        let segment_path = dir.path().join("0.log");
+        let max_size = Some(1024u64);
+        let base_offset = 0u64;
+
+        let mut entry_good = create_test_log_entry(base_offset, b"good_key", b"good_value");
+
+        // Manually serialize and corrupt an entry
+        let mut entry_bad = create_test_log_entry(base_offset + 1, b"bad_key", b"bad_value");
+        // Calculate its correct checksum first
+        let mut hasher = Hasher::new();
+        hasher.update(&entry_bad.key);
+        hasher.update(&entry_bad.value);
+        entry_bad.checksum = hasher.finalize();
+        entry_bad.key_length = entry_bad.key.len() as u32;
+        entry_bad.value_length = entry_bad.value.len() as u32;
+
+        let mut serialized_bad_entry = bincode::serialize(&entry_bad).unwrap();
+        // Corrupt by flipping a byte in the value part (need to be careful not to corrupt length fields)
+        // Find where value bytes start: offset, timestamp, key_len, value_len, checksum, key...
+        // Simplest: corrupt last byte of serialized data, likely part of value or key.
+        if !serialized_bad_entry.is_empty() {
+            let last_idx = serialized_bad_entry.len() - 1;
+            serialized_bad_entry[last_idx] = !serialized_bad_entry[last_idx];
+        }
+
+
+        {
+            let mut segment_file = OpenOptions::new().create(true).read(true).write(true).open(&segment_path).unwrap();
+
+            // Write a good entry
+            let _ = segment_file.seek(SeekFrom::Start(0)); // Ensure starting at 0 for this manual write
+            let mut temp_segment_writer = create_test_segment(dir.path(), base_offset, max_size, None); // Use its append logic
+            temp_segment_writer.append(&mut entry_good).unwrap();
+            // Good entry is written. temp_segment_writer is dropped, file closed.
+
+            // Re-open to append corrupted data manually
+            let mut file_appender = OpenOptions::new().append(true).open(&segment_path).unwrap();
+            file_appender.write_all(&serialized_bad_entry).unwrap();
+            file_appender.flush().unwrap();
+        } // file_appender is dropped
+
+        // Now try to load the segment. It should detect the checksum error on the second entry.
+        match LogSegment::load_existing(segment_path.clone(), base_offset, max_size, None) {
+            Ok(segment) => {
+                // Depending on how load_existing handles errors (stops or skips),
+                // this might pass if it loads only the first good entry.
+                // The current load_existing returns Err on first corruption.
+                panic!("Segment load should have failed due to checksum mismatch, but succeeded. Loaded {} entries.", segment.num_entries());
+            }
+            Err(Error::InitializationError(msg)) => {
+                assert!(msg.contains("Checksum mismatch during segment load"));
+            }
+            Err(e) => {
+                panic!("Expected InitializationError with checksum message, got {:?}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_segment_has_expired() {
+        let dir = tempdir().unwrap();
+        let short_duration = Duration::from_millis(50);
+        let long_duration = Duration::from_secs(3600);
+
+        // Segment with duration, initially not expired
+        let mut seg_with_short_ttl = create_test_segment(dir.path(), 0, Some(1024), Some(short_duration));
+        let mut entry = create_test_log_entry(0, b"k", b"v");
+        seg_with_short_ttl.append(&mut entry).unwrap(); // Add an entry so it's not considered "active empty" by some interpretations
+        assert!(!seg_with_short_ttl.has_expired(), "Segment should not be expired immediately after creation");
+
+        // Segment without duration
+        let seg_no_ttl = create_test_segment(dir.path(), 1, Some(1024), None);
+        assert!(!seg_no_ttl.has_expired(), "Segment without max_duration should never expire");
+
+        // Segment with long duration
+        let seg_with_long_ttl = create_test_segment(dir.path(), 2, Some(1024), Some(long_duration));
+        assert!(!seg_with_long_ttl.has_expired(), "Segment with long TTL should not be expired soon");
+
+        // Wait for short_duration to pass
+        std::thread::sleep(short_duration + Duration::from_millis(20)); // Sleep a bit longer
+
+        assert!(seg_with_short_ttl.has_expired(), "Segment should be expired after short_duration");
+        assert!(!seg_no_ttl.has_expired(), "Segment without max_duration should still not expire");
+        assert!(!seg_with_long_ttl.has_expired(), "Segment with long TTL should still not be expired");
+    }
+     #[test]
+    fn test_segment_has_expired_empty_active_rule() {
+        let dir = tempdir().unwrap();
+        let short_duration = Duration::from_millis(10);
+        let mut seg = LogSegment {
+            base_offset: 0,
+            file_path: dir.path().join("0.log"),
+            file: OpenOptions::new().create(true).read(true).write(true).open(dir.path().join("0.log")).unwrap(),
+            current_size: 0,
+            max_segment_size: 1024,
+            index: Vec::new(),
+            created_at: SystemTime::now() - short_duration * 2, // Created in the past
+            max_segment_duration: Some(short_duration),
+            num_entries: 0, // Explicitly empty
+        };
+        // The rule "Don't expire empty segments that are active" is subtle.
+        // has_expired() itself doesn't know if it's active.
+        // If num_entries is 0, the current has_expired() returns false.
+        // If an empty segment is old enough, it has expired.
+        assert!(seg.has_expired(), "Old empty segment should report as expired");
+
+        // If it has entries and is old, it should also expire
+        seg.num_entries = 1;
+        assert!(seg.has_expired(), "Non-empty old segment should report as expired");
+
+        // If it's new, it shouldn't expire
+        seg.created_at = SystemTime::now();
+        seg.num_entries = 0;
+        assert!(!seg.has_expired(), "New empty segment should not be expired");
+        seg.num_entries = 1;
+        assert!(!seg.has_expired(), "New non-empty segment should not be expired");
     }
 }
